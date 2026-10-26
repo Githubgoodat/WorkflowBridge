@@ -1,0 +1,2 @@
+# Version used for the verified Windows x64 portable build.
+pyinstaller==6.22.3

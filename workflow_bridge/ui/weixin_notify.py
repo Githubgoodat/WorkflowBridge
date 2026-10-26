@@ -1,0 +1,829 @@
+"""Opt-in direct WeChat task notices; QR login and every test are explicit.
+
+This client accepts only the scanner's context from the separate core adapter.
+The separate, explicitly enabled question channel can deliver coded ordinary
+answers to their registered executor. It never approves actions or runs text.
+"""
+from __future__ import annotations
+
+from collections import deque
+from datetime import datetime, timedelta, timezone
+import hashlib
+import importlib
+from pathlib import Path, PureWindowsPath
+import re
+import sys
+import threading
+
+from PyQt5.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QImage, QPainter, QPixmap
+from PyQt5.QtWidgets import QCheckBox, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+
+from workflow_bridge.core.paths import PROJECT_ROOT, get_user_data_dir
+from workflow_bridge.core.weixin_notify import (
+    DEFAULT_BASE_URL, WeixinClient, WeixinConfig, WeixinNotifyError,
+    load_config, logout, save_config,
+)
+
+
+_SOURCES = {"codex": "Codex", "grok_bot": "grok bot（协作上报）"}
+_STATES = {
+    "needs_attention": "〈{project}〉记录到授权请求，请返回 {where} 核对是否仍需处理。",
+    "turn_ended": "〈{project}〉本轮结束，请返回 {where} 核对结果；不代表整个任务完成。",
+    "phase_ended": "〈{project}〉当前阶段结束，请返回 {where} 核对结果；不代表整个任务完成。",
+    "interrupted": "〈{project}〉本轮中断，请返回 {where} 确认后续操作。",
+    "failed": "〈{project}〉来源上报失败，请返回 {where} 核对。",
+    "input_requested": "〈{project}〉发起输入请求，请返回 Codex 查看。",
+    "question_opened": "〈{project}〉发起提问，请返回 Codex 查看；任务可能仍在继续。",
+}
+_STATE_LABELS = {
+    "needs_attention": "授权请求", "turn_ended": "本轮结束", "phase_ended": "阶段结束",
+    "interrupted": "本轮中断", "failed": "来源上报失败",
+    "input_requested": "输入请求", "question_opened": "提问事件",
+}
+_INPUT_STATES = {"input_requested", "question_opened"}
+_TERMINAL_STATES = {"turn_ended", "phase_ended", "interrupted", "failed"}
+_DEFINITIVE_FAILURES = {
+    "api_rejected_minus2", "api_rejected", "session_expired", "context_missing",
+    "credentials_missing", "context_refresh_required",
+}
+_ERRORS = {
+    "credentials_missing": "请先通过本人微信扫码确认登录。",
+    "context_missing": "缺少本人上下文。请本人先给机器人发一句文字，再点“建立本人上下文”。",
+    "session_expired": "微信登录已过期，请重新扫码登录；没有自动重试或补发。",
+    "context_refresh_required": "请本人先给机器人再发一句文字，然后重新建立上下文。",
+    "api_rejected": "微信服务未受理；请核对登录和本人上下文，不会自动重试。",
+    "api_rejected_minus2": "微信服务拒绝请求（-2），通知已暂停；原因尚不能确定。请先给机器人发一句话、重新建立本人上下文，再显式测试并启用。没有自动重试。",
+    "network_error": "连接微信服务失败，请稍后显式重试；没有自动补发。",
+    "poll_connect_timeout": "微信接收连接超时，保留游标后稍后重查。",
+    "poll_tls_error": "微信接收安全连接失败，保留游标后稍后重查。",
+    "poll_connection_error": "微信接收网络连接失败，保留游标后稍后重查。",
+    "bad_response": "微信服务返回了无法验证的结果，未认定发送成功。",
+    "unsafe_url": "微信服务返回的地址未通过校验，已停止本次操作。",
+    "config_error": "本机微信设置无法读取或安全保存，提醒保持关闭。",
+    "acceptance_unknown": "服务未返回明确受理凭据，不能确认发送成功；请先自行核对手机，不自动重试。",
+}
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def _project_name(snapshot):
+    """Return only the authorized project basename, never an opaque task id."""
+    value = getattr(snapshot, "project", None)
+    if not isinstance(value, str):
+        return "未命名项目"
+    value = " ".join("".join(
+        " " if char.isspace() else char if char.isprintable() and char not in "〈〉" else ""
+        for char in value
+    ).split())
+    # A URL is a device/account address rather than a project pathname.
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]+://", value):
+        return "未命名项目"
+    label = PureWindowsPath(value).name.strip()
+    if not label or label in {".", ".."} or ":" in label:
+        return "未命名项目"
+    identifiers = (getattr(snapshot, field, None) for field in ("task_id", "turn_id", "notice_id"))
+    if any(isinstance(identity, str) and identity
+           and (identity == label or len(identity) >= 8 and identity in label)
+           for identity in identifiers):
+        return "未命名项目"
+    return label[:70].strip() or "未命名项目"
+
+
+def notice_text(snapshot):
+    source_name, status = getattr(snapshot, "source", None), getattr(snapshot, "status", None)
+    if not isinstance(source_name, str) or not isinstance(status, str):
+        return None
+    source, state = _SOURCES.get(source_name), _STATES.get(status)
+    if source is None or state is None or not isinstance(getattr(snapshot, "task_id", None), str):
+        return None
+    if status in _INPUT_STATES and source_name != "codex":
+        return None
+    label = _STATE_LABELS[status]
+    if status == "needs_attention" and source_name == "grok_bot":
+        label = "需要输入"
+        state = "〈{project}〉需要补充信息，请返回 grok bot 查看问题。"
+    body = state.format(project=_project_name(snapshot), where="Codex" if source_name == "codex" else "grok bot")
+    if status in _INPUT_STATES and getattr(snapshot, "authorization_observed", False) is True:
+        label += "／授权记录"
+        body += "同时记录到授权请求，请一并核对。"
+    return "任务桥接 · 任务提醒\n来源：" + source + "\n状态：" + label + "\n" + body
+
+
+def _load_qrcode():
+    try:
+        return importlib.import_module("qrcode")
+    except ImportError:
+        # Only the administrator-managed dependency directory in this project.
+        vendor = PROJECT_ROOT / "vendor" / "weixin"
+        if not (vendor / "qrcode" / "__init__.py").is_file():
+            raise
+        if str(vendor) not in sys.path:
+            sys.path.insert(0, str(vendor))
+        return importlib.import_module("qrcode")
+
+
+def qr_available():
+    try:
+        return callable(_load_qrcode().QRCode)
+    except (ImportError, AttributeError, OSError):
+        return False
+
+
+def render_qr(content):
+    """Encode login content locally; never fetch it or use an image website."""
+    if not isinstance(content, str) or not 1 <= len(content) <= 8192:
+        raise ValueError("Invalid QR content")
+    qr = _load_qrcode().QRCode(border=4, box_size=1)
+    qr.add_data(content)
+    qr.make(fit=True)
+    matrix = qr.get_matrix()
+    size = len(matrix)
+    if not 21 <= size <= 185 or any(len(row) != size for row in matrix):
+        raise ValueError("Unsupported QR size")
+    scale = max(1, min(6, 330 // size))
+    image = QImage(size * scale, size * scale, QImage.Format_RGB32)
+    image.fill(Qt.white)
+    painter = QPainter(image)
+    for y, row in enumerate(matrix):
+        for x, dark in enumerate(row):
+            if dark:
+                painter.fillRect(x * scale, y * scale, scale, scale, QColor(Qt.black))
+    painter.end()
+    return QPixmap.fromImage(image)
+
+
+class WeixinWorker(QThread):
+    result_ready = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, operation, arguments=(), parent=None, *, client_factory=WeixinClient):
+        super().__init__(parent)
+        self.operation, self.arguments = operation, arguments
+        self._factory = client_factory
+        self._cancelled = threading.Event()
+
+    def cancel(self):
+        self._cancelled.set()
+
+    def run(self):
+        client = None
+        try:
+            if self._cancelled.is_set():
+                return
+            client = self._factory()
+            if self._cancelled.is_set():
+                return
+            if self.operation == "qr":
+                result = client.request_qr()
+            elif self.operation == "poll":
+                result = client.poll_qr(self.arguments[0], base_url=self.arguments[1])
+            elif self.operation == "context":
+                result = client.get_updates(self.arguments[0], cursor=self.arguments[1])
+            elif self.operation == "replies":
+                result = client.get_reply_updates(self.arguments[0], cursor=self.arguments[1])
+            elif self.operation in {"send", "question_send"}:
+                result = client.send_notice(*self.arguments)
+            else:
+                return
+            if not self._cancelled.is_set():
+                self.result_ready.emit(result)
+        except WeixinNotifyError as exc:
+            if not self._cancelled.is_set():
+                self.error.emit(exc.code if exc.code in _ERRORS else "bad_response")
+        except Exception:
+            if not self._cancelled.is_set():
+                self.error.emit("bad_response")
+        finally:
+            self.arguments = ()
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+
+class WeixinDialog(QDialog):
+    closing = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("任务桥接 · 微信任务提醒")
+        self.resize(580, 580)
+        layout = QVBoxLayout(self)
+        self.info = QLabel(
+            "使用开源微信渠道直接发给扫码本人，不经过公众号推送。\n"
+            "按你的选择发送项目名、来源和状态；项目只取文件夹名称，不含完整路径、聊天正文或任务编号，也不执行手机消息。\n"
+            "登录保存在本机时使用当前系统账户的安全存储。服务受理不等于手机已收到。"
+        )
+        self.info.setTextFormat(Qt.PlainText)
+        self.info.setWordWrap(True)
+        layout.addWidget(self.info)
+        row = QHBoxLayout()
+        self.login = QPushButton("扫码登录微信")
+        self.check = QPushButton("检查扫码状态")
+        self.stop = QPushButton("停止当前请求")
+        for button in (self.login, self.check, self.stop):
+            row.addWidget(button)
+        layout.addLayout(row)
+        self.qr = QLabel("仅点击“扫码登录微信”后请求二维码。")
+        self.qr.setTextFormat(Qt.PlainText)
+        self.qr.setAlignment(Qt.AlignCenter)
+        self.qr.setMinimumHeight(240)
+        layout.addWidget(self.qr)
+        self.context = QPushButton("已给机器人发消息，建立本人上下文")
+        layout.addWidget(self.context)
+        self.enabled = QCheckBox("启用微信任务状态提醒")
+        layout.addWidget(self.enabled)
+        row = QHBoxLayout()
+        self.save = QPushButton("保存设置")
+        self.test = QPushButton("发送一条测试提醒")
+        self.logout = QPushButton("退出并清除本机微信登录")
+        for button in (self.save, self.test, self.logout):
+            row.addWidget(button)
+        layout.addLayout(row)
+        self.status = QLabel()
+        self.status.setTextFormat(Qt.PlainText)
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.limit = QLabel("免打扰、停止任务跟进或退出后不再提交新提醒；已经在途的请求无法撤回。恢复后不补发。")
+        self.limit.setTextFormat(Qt.PlainText)
+        self.limit.setWordWrap(True)
+        layout.addWidget(self.limit)
+
+    def closeEvent(self, event):
+        self.closing.emit()
+        super().closeEvent(event)
+
+
+class WeixinNotifyController(QObject):
+    status_changed = pyqtSignal(str)
+    automatic_notice_failed = pyqtSignal(object)
+    question_replies = pyqtSignal(object, str)
+    question_send_result = pyqtSignal(str)
+    question_transport_error = pyqtSignal(str)
+    slot_available = pyqtSignal()
+
+    def __init__(self, runtime, parent=None, *, config_path=None, worker_factory=WeixinWorker,
+                 clock=_utc_now, qr_renderer=render_qr, qr_check=qr_available, dialog=None):
+        super().__init__(parent)
+        self.runtime = runtime
+        self.config_path = Path(config_path) if config_path is not None else get_user_data_dir() / "workflow-weixin.json"
+        self.dialog = dialog or WeixinDialog()
+        self._factory, self._clock = worker_factory, clock
+        self._qr_renderer, self._qr_check = qr_renderer, qr_check
+        self._closed = False
+        self._paused = runtime.is_paused()
+        self._tracking = True
+        self._enabled = False
+        self._saved_enabled = False
+        self._questions_enabled = False
+        self._question_epoch = 0
+        self._question_fault = False
+        self._bootstrap_ready = False
+        self._receive_retry_at = self._clock()
+        self._question_update_deferred = False
+        self._context_refresh_pending = False
+        self._credentials = None
+        self._binding_committed = False
+        self._context = self._cursor = ""
+        self._epoch = 0
+        self._send_epoch = 0
+        self._active = None
+        self._reply_active = None
+        self._active_auto_notice = None
+        self._workers = set()
+        self._queue = deque()
+        self._last_sent = {}
+        self._input_seen = {}
+        self._input_seen_before = None
+        self._input_watch_started = self._clock()
+        self._qrcode = None
+        self._qr_base = DEFAULT_BASE_URL
+        self._qr_deadline = None
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(2_000)
+        self._poll_timer.timeout.connect(self.check_login)
+        self._question_timer = QTimer(self)
+        self._question_timer.setInterval(1_000)
+        self._question_timer.timeout.connect(self.poll_question_replies)
+        self.status_text = "微信提醒未启用；仅显式扫码登录或发送测试时访问服务。"
+        try:
+            config = load_config(self.config_path)
+            self._credentials, self._context, self._cursor = config.credentials, config.context_token, config.cursor
+            self._binding_committed = self._credentials is not None
+            self._enabled = bool(config.enabled and self._credentials and self._context)
+            self._saved_enabled = config.enabled
+            if self._enabled:
+                self.status_text = "微信提醒已启用，仅等待后续新的任务状态事件。"
+        except Exception:
+            self.status_text = "本机微信设置无法读取或解密，提醒保持关闭，请重新扫码设置。"
+        d = self.dialog
+        d.enabled.setChecked(self._enabled)
+        d.login.clicked.connect(self.login)
+        d.check.clicked.connect(self.check_login)
+        d.stop.clicked.connect(self.cancel)
+        d.context.clicked.connect(self.establish_context)
+        d.save.clicked.connect(self.save_settings)
+        d.test.clicked.connect(self.send_test)
+        d.logout.clicked.connect(self.clear_login)
+        d.closing.connect(self._dialog_closed)
+        runtime.pause_changed.connect(self.set_paused)
+        self._set_status(self.status_text)
+
+    def _interactive_allowed(self):
+        return (not self._closed and not self._paused and self._tracking
+                and not self.runtime.closing)
+
+    def can_send_automatic(self):
+        return bool(self._enabled and self._interactive_allowed()
+                    and self._credentials is not None and self._context)
+
+    def question_owner_key(self):
+        if self._credentials is None or not self._binding_committed:
+            return ""
+        value = self._credentials.bot_id + "\0" + self._credentials.scanner_id
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def question_channel_available(self):
+        return bool(self._interactive_allowed() and self._credentials is not None
+                    and self._binding_committed and self._bootstrap_ready
+                    and self._context and not self._question_fault and not self._qrcode
+                    and (self._active is None or self._active.operation not in {"qr", "poll"}))
+
+    def set_question_channel(self, enabled):
+        enabled = bool(enabled)
+        if self._questions_enabled and not enabled:
+            self._question_epoch += 1
+            self._bootstrap_ready = False
+            if self._reply_active is not None:
+                self._reply_active.cancel()
+            if self._active is not None and self._active.operation == "question_send":
+                self._active.cancel()
+        self._questions_enabled = enabled
+        if self._questions_enabled and self._interactive_allowed() and not self._question_fault:
+            self._question_timer.start()
+        else:
+            self._question_timer.stop()
+
+    def retry_question_channel(self):
+        self._question_fault = False
+        self._bootstrap_ready = False
+        self._receive_retry_at = self._clock()
+        self.set_question_channel(self._questions_enabled)
+
+    def can_send_question(self):
+        return bool(self._questions_enabled and self.question_channel_available()
+                    and self._context and self._active is None and not self._queue)
+
+    def send_question_notice(self, text):
+        if not self.can_send_question() or not isinstance(text, str) or not 0 < len(text) <= 2000:
+            return False
+        return self._start("question_send", (self._credentials, self._context, text),
+                           lambda result: self.question_send_result.emit(
+                               "accepted" if result.accepted else "acceptance_unknown"))
+
+    def poll_question_replies(self):
+        if (not self._questions_enabled or not self._interactive_allowed()
+                or self._credentials is None or self._question_fault
+                or not self._binding_committed
+                or self._reply_active is not None or self._qrcode
+                or self._active is not None and self._active.operation in {"qr", "poll", "context"}
+                or self._clock() < self._receive_retry_at):
+            return False
+        return self._start("replies", (self._credentials, self._cursor), self._question_updates_ready)
+
+    def _question_updates_ready(self, value):
+        previous_cursor = self._cursor
+        previous_context = self._context
+        was_ready = self._bootstrap_ready
+        self._context_refresh_pending = False
+        self._question_update_deferred = False
+        changed = self._cursor != value.cursor or bool(value.context_token and value.context_token != self._context)
+        self._cursor = value.cursor
+        if value.context_token:
+            self._context = value.context_token
+        if self._questions_enabled:
+            self.question_replies.emit(value.messages, self.question_owner_key())
+        if self._question_update_deferred:
+            self._cursor = previous_cursor
+            self._receive_retry_at = self._clock() + timedelta(seconds=1)
+        if changed:
+            try:
+                # Receive cursor updates are part of the opted-in channel, not
+                # a change to the saved automatic-notification preference.
+                save_config(self.config_path, WeixinConfig(
+                    self._saved_enabled, self._credentials, self._context, self._cursor))
+            except Exception:
+                self._question_fault = True
+                self._bootstrap_ready = False
+                self._question_timer.stop()
+                self.question_transport_error.emit("config_error")
+                return
+        self._bootstrap_ready = True
+        if not was_ready or not previous_context and self._context:
+            self._set_status("微信本人接收通道已就绪，问题发送与接收可以并行。"
+                             if self._context else "微信本人接收已就绪；等待本人消息建立回复上下文。")
+
+    def defer_question_update(self):
+        # The broker could not durably accept a reply. Retain the prior cursor
+        # so the next read can replay it; first-answer/message-id deduplication
+        # protects replies that were already committed in the same batch.
+        self._question_update_deferred = True
+
+    def _set_status(self, text):
+        self.status_text = text
+        self.dialog.status.setText(text)
+        self.status_changed.emit(text)
+
+    def open(self):
+        if self._closed or self._paused or self.runtime.closing:
+            return
+        self.dialog.show()
+        self.dialog.raise_()
+        self.dialog.activateWindow()
+
+    def _start(self, operation, arguments, callback, *, auto_notice=None):
+        incoming = operation == "replies"
+        if not self._interactive_allowed():
+            return False
+        if incoming:
+            if (self._reply_active is not None or
+                    self._active is not None and self._active.operation in {"qr", "poll", "context"}):
+                return False
+        elif self._active is not None or operation == "context" and self._reply_active is not None:
+            return False
+        epoch = self._epoch
+        send_epoch = self._send_epoch
+        question_epoch = self._question_epoch
+        def allowed():
+            return (epoch == self._epoch and self._interactive_allowed()
+                    and (self._reply_active is worker if incoming else
+                         self._active is worker and send_epoch == self._send_epoch)
+                    and (operation not in {"replies", "question_send"}
+                         or self._questions_enabled and self._binding_committed
+                         and question_epoch == self._question_epoch))
+        worker = self._factory(operation, arguments, parent=self)
+        self._workers.add(worker)
+        if incoming:
+            self._reply_active = worker
+        else:
+            self._active = worker
+            self._active_auto_notice = auto_notice
+        worker.result_ready.connect(lambda value: callback(value) if allowed() else None)
+        worker.error.connect(lambda code: self._job_error(operation, code)
+                             if allowed() else None)
+        worker.finished.connect(lambda: self._retire_reply(worker) if incoming else self._retire(worker))
+        worker.start()
+        return True
+
+    def _job_error(self, operation, code):
+        if operation == "replies":
+            if code in {"network_error", "poll_connect_timeout", "poll_tls_error", "poll_connection_error"}:
+                # Read-only long polling may time out. This never resends an
+                # outgoing question or applies an answer more than once.
+                self._receive_retry_at = self._clock() + timedelta(seconds=3)
+            else:
+                self._question_fault = True
+                self._bootstrap_ready = False
+                self._context_refresh_pending = False
+                self._question_timer.stop()
+            self.question_transport_error.emit(code)
+            return
+        if operation == "question_send":
+            self.question_send_result.emit(code)
+        failed = []
+        if operation in {"qr", "poll"}:
+            self._poll_timer.stop()  # A failed poll requires an explicit retry.
+        if code in _DEFINITIVE_FAILURES:
+            if operation == "send" and self._active_auto_notice is not None:
+                failed.append(self._active_auto_notice)
+            failed.extend(record for _, _, record in self._queue)
+            # Pause this runtime before routing failed automatic notices. Do
+            # not guess that a timeout/unknown response was never delivered.
+            self._enabled = False
+            self._queue.clear()
+            self._active_auto_notice = None
+            # A rejected outgoing message does not invalidate a concurrent
+            # owner read. Only the sending slot's late callbacks are stale.
+            self._send_epoch += 1
+            self.dialog.enabled.setChecked(False)
+        self._set_status(_ERRORS.get(code, _ERRORS["bad_response"]))
+        if self._interactive_allowed():
+            failed.sort(key=lambda record: record.status not in _INPUT_STATES
+                        and record.status != "needs_attention")
+            for record in failed:
+                if not self._interactive_allowed():
+                    break
+                self.automatic_notice_failed.emit(record)
+
+    def _retire(self, worker):
+        self._workers.discard(worker)
+        if self._active is worker:
+            self._active = None
+            self._active_auto_notice = None
+        worker.deleteLater()
+        self._flush_context_refresh()
+        self._drain()
+        if self._active is None:
+            self.slot_available.emit()
+
+    def _retire_reply(self, worker):
+        self._workers.discard(worker)
+        if self._reply_active is worker:
+            self._reply_active = None
+        worker.deleteLater()
+        self._flush_context_refresh()
+        self.slot_available.emit()
+
+    def _flush_context_refresh(self):
+        if (not self._context_refresh_pending or not self._interactive_allowed()
+                or self._credentials is None or self._qrcode):
+            return
+        if self._questions_enabled and self._binding_committed:
+            self.poll_question_replies()
+        elif self._reply_active is None and self._active is None:
+            if self._start("context", (self._credentials, self._cursor), self._context_ready):
+                self._context_refresh_pending = False
+
+    def _invalidate(self):
+        self._epoch += 1
+        self._bootstrap_ready = False
+        self._context_refresh_pending = False
+        self._input_watch_started = self._clock()
+        self._queue.clear()
+        self._active_auto_notice = None
+        self._poll_timer.stop()
+        self._question_timer.stop()
+        self._qrcode = None
+        self.dialog.qr.clear()
+        if self._active is not None:
+            self._active.cancel()
+        if self._reply_active is not None:
+            self._reply_active.cancel()
+
+    def _dialog_closed(self):
+        if self._closed:
+            return
+        interactive = self._active is not None and self._active.operation in {"qr", "poll", "context"}
+        if self._qrcode or interactive:
+            self._invalidate()
+            self._set_status("设置窗口已关闭，扫码和上下文请求已停止；没有保存或启用新登录。")
+
+    def cancel(self, *_args):
+        if not self._closed:
+            self._invalidate()
+            self._set_status("当前请求已停止；已经在途的请求无法撤回，后续不补发。")
+
+    def login(self):
+        if not self._interactive_allowed():
+            return
+        if not self._qr_check():
+            self._set_status("缺少二维码组件，请安装 requirements.txt；本地任务跟进仍可使用。")
+            return
+        if self._active is not None:
+            self._set_status("上一个请求尚未结束，请稍后重新点击扫码登录。")
+            return
+        self._invalidate()
+        self._binding_committed = False
+        self._enabled = False
+        self.dialog.enabled.setChecked(False)
+        self._set_status("正在请求本次登录二维码……")
+        self._start("qr", (), self._qr_ready)
+
+    def _qr_ready(self, value):
+        try:
+            pixmap = self._qr_renderer(value.qrcode_img_content)
+            self._qrcode = value.qrcode
+            self._qr_base = DEFAULT_BASE_URL
+            self._qr_deadline = self._clock() + timedelta(minutes=2)
+            self.dialog.qr.setPixmap(pixmap)
+        except Exception:
+            self._set_status("二维码无法在本机绘制，请核对 requirements.txt 后显式重试。")
+            return
+        self._set_status("请用本人微信扫描并确认登录。二维码仅在本机绘制，不发送到外部生成网站。")
+        self._poll_timer.start()
+
+    def check_login(self):
+        if not self._interactive_allowed() or not self._qrcode or self._active is not None:
+            return
+        if self._clock() >= self._qr_deadline:
+            self._poll_timer.stop()
+            self._qrcode = None
+            self.dialog.qr.clear()
+            self._set_status("本次扫码等待已结束，请重新点击扫码登录。")
+            return
+        self._start("poll", (self._qrcode, self._qr_base), self._login_checked)
+
+    def _login_checked(self, value):
+        if value.status in {"pending", "scanned"}:
+            self._qr_base = value.poll_base_url
+            self._set_status("已扫码，请在本人微信确认登录。" if value.status == "scanned" else "等待本人微信扫码确认……")
+        elif value.status == "confirmed" and value.credentials is not None:
+            self._invalidate()
+            self._credentials = value.credentials
+            self._binding_committed = False
+            self._context = self._cursor = ""
+            self._question_fault = False
+            self._receive_retry_at = self._clock()
+            self._qrcode = None
+            self._poll_timer.stop()
+            self.dialog.qr.clear()
+            self._set_status("已确认扫码。请本人给刚登录的机器人发一句文字，再点“建立本人上下文”。尚未启用提醒。")
+        else:
+            self._qrcode = None
+            self._poll_timer.stop()
+            self.dialog.qr.clear()
+            self._set_status("本次登录需要重新验证或二维码已过期，请重新扫码。")
+
+    def establish_context(self):
+        if not self._interactive_allowed():
+            return
+        if self._credentials is None:
+            self._set_status("请先通过本人微信扫码确认登录。")
+            return
+        self._context_refresh_pending = True
+        if (self._questions_enabled and self._binding_committed) or self._reply_active is not None:
+            self.retry_question_channel()
+            self._flush_context_refresh()
+            self._set_status("微信问答共用接收通道，正在核对本人上下文。")
+        else:
+            self._set_status("仅核对扫码本人发来的消息上下文，不执行消息内容……")
+            self._flush_context_refresh()
+
+    def _context_ready(self, value):
+        self._cursor = value.cursor
+        if value.context_token:
+            self._context = value.context_token
+            self._set_status("本人上下文已建立。可显式发送测试，或勾选启用后保存设置。")
+        else:
+            self._set_status("尚未收到扫码本人的新上下文。请本人给机器人发一句文字，再点击建立。")
+
+    def save_settings(self):
+        if self._closed:
+            return
+        enabled = self.dialog.enabled.isChecked()
+        if enabled and (self._credentials is None or not self._context):
+            self._set_status(_ERRORS["context_missing"])
+            return
+        self._invalidate()
+        self._enabled = False
+        try:
+            save_config(self.config_path, WeixinConfig(enabled=enabled, credentials=self._credentials,
+                                                      context_token=self._context, cursor=self._cursor))
+        except Exception:
+            self.dialog.enabled.setChecked(False)
+            self._set_status("本机微信设置未能安全保存，提醒保持关闭；没有发送任何测试。")
+            return
+        self._enabled = enabled
+        self._saved_enabled = enabled
+        self._binding_committed = self._credentials is not None
+        self.set_question_channel(self._questions_enabled)
+        self._set_status("微信提醒设置已保存；只处理之后的新事件，不补发旧提醒。" if enabled else "微信提醒已关闭并保存。")
+
+    def clear_login(self):
+        if self._closed:
+            return
+        self._invalidate()
+        self._enabled = False
+        self._saved_enabled = False
+        self._binding_committed = False
+        self._credentials = None
+        self._context = self._cursor = ""
+        self.dialog.enabled.setChecked(False)
+        try:
+            logout(self.config_path)
+        except Exception:
+            self._set_status("本次运行已关闭微信提醒，但本机登录文件未能移除，请检查目录权限。")
+            return
+        self._set_status("已清除本机微信登录和上下文。")
+
+    def send_test(self):
+        if not self._interactive_allowed():
+            return
+        if self._credentials is None or not self._context:
+            self._set_status(_ERRORS["context_missing"])
+            return
+        if self._active is not None:
+            self._set_status("上一个请求尚未结束，请稍后再次显式发送测试。")
+            return
+        self._set_status("正在提交你主动要求的测试提醒……")
+        self._start("send", (self._credentials, self._context,
+                             "任务桥接 · 微信任务提醒测试\n这是你主动发送的测试消息，不包含任务正文。请确认本人手机是否收到。"),
+                    self._sent)
+
+    def _sent(self, value):
+        self._set_status("微信服务已受理，请自行确认本人手机是否收到；受理不等于送达。" if value.accepted
+                         else "微信服务未受理本次提醒，没有自动重试或补发。")
+
+    def enqueue(self, snapshot):
+        if not self._interactive_allowed() or not self._enabled:
+            return
+        now = self._clock()
+        text = notice_text(snapshot)
+        if text is None or snapshot.is_stale(now):
+            return
+        is_input = snapshot.status in _INPUT_STATES
+        terminal = snapshot.status in _TERMINAL_STATES
+        if is_input:
+            notice_id = getattr(snapshot, "notice_id", None)
+            if snapshot.source != "codex" or not isinstance(notice_id, str) or not notice_id:
+                return
+            try:
+                observed = datetime.fromisoformat(snapshot.observed_at.replace("Z", "+00:00"))
+                if observed.tzinfo is None or observed > now:
+                    return
+            except (AttributeError, TypeError, ValueError):
+                return
+            if notice_id in self._input_seen or (
+                    observed <= self._input_watch_started or
+                    self._input_seen_before is not None and observed <= self._input_seen_before):
+                return
+            # Remember even a queue-full drop: this event must not be replayed
+            # later merely because a slot becomes available.
+            self._input_seen[notice_id] = observed
+            while len(self._input_seen) > 256:
+                oldest = min(self._input_seen, key=lambda value: (self._input_seen[value], value))
+                removed = self._input_seen.pop(oldest)
+                self._input_seen_before = max(self._input_seen_before or removed, removed)
+        else:
+            key = (("terminal", snapshot.source, snapshot.task_id, snapshot.turn_id, snapshot.status)
+                   if terminal else (snapshot.source, snapshot.task_id, snapshot.status))
+            last = self._last_sent.get(key)
+            if last is not None and (terminal or now - last < timedelta(seconds=30)):
+                return
+            if terminal:
+                # The same terminal fact can be delivered with a newer file
+                # timestamp. Consume its stable turn identity, including drops.
+                self._last_sent[key] = now
+                if len(self._last_sent) > 256:
+                    self._last_sent.pop(min(self._last_sent, key=self._last_sent.get))
+        critical = is_input or snapshot.status == "needs_attention"
+        ordinary_waiting = sum(not urgent for urgent, _, _ in self._queue)
+        if critical and len(self._queue) >= 4:
+            # A later input request may replace an ordinary pending update,
+            # but never an already submitted request or another input request.
+            ordinary = next((index for index in range(len(self._queue) - 1, -1, -1)
+                             if not self._queue[index][0]), None)
+            if ordinary is not None:
+                del self._queue[ordinary]
+        if len(self._queue) >= 4 or not critical and ordinary_waiting >= 3:
+            self._set_status("微信提醒待发队列已满，本条已丢弃；不会之后补发。")
+            return
+        if not is_input and not terminal:
+            self._last_sent[key] = now
+            if len(self._last_sent) > 256:
+                self._last_sent.pop(min(self._last_sent, key=self._last_sent.get))
+        if critical:
+            # Keep FIFO among input/approval requests while placing them ahead
+            # of pending lifecycle endings. Four waiting items remains the cap.
+            position = sum(urgent for urgent, _, _ in self._queue)
+            self._queue.insert(position, (True, text, snapshot))
+        else:
+            self._queue.append((False, text, snapshot))
+        self._drain()
+
+    def _drain(self):
+        if (not self._interactive_allowed() or not self._enabled or self._active is not None
+                or not self._queue or self._credentials is None or not self._context):
+            return
+        _, text, record = self._queue.popleft()
+        self._set_status("正在提交新的任务状态提醒……")
+        self._start("send", (self._credentials, self._context, text), self._sent, auto_notice=record)
+
+    def set_tracking(self, enabled):
+        if self._closed:
+            return
+        self._tracking = bool(enabled)
+        self._input_watch_started = self._clock()
+        if not self._tracking:
+            self._invalidate()
+            self._set_status("任务跟进已暂停，微信待发提醒已清空；已经在途的请求无法撤回。")
+        elif self._interactive_allowed():
+            self._set_status("任务跟进已恢复；只等待之后的新事件，不补发旧提醒。")
+            self.set_question_channel(self._questions_enabled)
+
+    def set_paused(self, paused):
+        if self._closed:
+            return
+        self._paused = bool(paused)
+        self._input_watch_started = self._clock()
+        if self._paused:
+            self._invalidate()
+            self._set_status("免打扰中：暂停微信请求并清空待发提醒；已经在途的请求无法撤回。")
+        elif self._interactive_allowed():
+            self._set_status("免打扰已解除；只等待之后的新事件，不补发旧提醒。")
+            self.set_question_channel(self._questions_enabled)
+
+    def shutdown(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._invalidate()
+        self._credentials = None
+        self._context = self._cursor = ""
+        self._input_seen.clear()
+        self.dialog.hide()
+        self.dialog.setEnabled(False)
